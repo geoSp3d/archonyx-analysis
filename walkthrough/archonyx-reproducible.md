@@ -1,4 +1,4 @@
-# Archonyx — Walkthrough reproducible
+# Archonyx, Walkthrough reproducible
 
 > Este documento describe la reproducción operativa del exploit en un entorno autorizado y aislado.  
 > Para el análisis del razonamiento y las primitivas, consulta [el artículo técnico](../article/archonyx-analysis.md).

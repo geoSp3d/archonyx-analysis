@@ -1,4 +1,4 @@
-# Archonyx — De un bot autenticado a RCE
+# Archonyx, De un bot autenticado a RCE
 
 Análisis técnico y reproducción de **Archonyx**, un reto Web Medium de Cyber Apocalypse CTF 2026: The Salt Crown.
 

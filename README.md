@@ -112,34 +112,11 @@ Los archivos TAR generados no se incluyen en el repositorio.
 
 ## Primitiva principal
 
-Archonyx utilizaba:
+La etapa central abusaba de una discrepancia en el tratamiento de hardlinks durante la extracción TAR: se validaba el destino creado dentro del directorio de salida, pero no el archivo utilizado como origen del enlace.
 
-```text
-decompress 4.2.1
-decompress-tar 4.1.1
-```
+Una segunda entrada con el mismo nombre convertía ese enlace en una sobrescritura arbitraria sobre el inode compartido.
 
-El extractor validaba que el destino permaneciera dentro del directorio de salida, pero utilizaba directamente el `linkname` de las entradas hardlink como origen del enlace.
-
-La segunda entrada con el mismo nombre era escrita mediante `writeFile`, que truncaba y reescribía el inode existente en lugar de crear uno nuevo.
-
-Esto permitía transformar:
-
-```text
-hardlink absoluto
-+
-entrada duplicada
-+
-truncado sobre el inode compartido
-```
-
-en:
-
-```text
-sobrescritura arbitraria de un archivo externo
-```
-
-La explicación completa y el código verificado están en el [análisis técnico](article/archonyx-analysis.md).
+La explicación completa, las versiones verificadas y el comportamiento exacto de `fs.link` y `writeFile` están en el [análisis técnico](article/archonyx-analysis.md).
 
 ## Alcance
 

